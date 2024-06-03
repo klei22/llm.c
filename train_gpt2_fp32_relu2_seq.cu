@@ -243,29 +243,12 @@ __device__ float vec_at(const float4& vec, int index) {
     return reinterpret_cast<const float*>(&vec)[index];
 }
 
-__global__ void polymax_forward_kernel(float* out, const float* inp, int sequence_length, int N, int T, float x_intercept, float y_intercept, float linear_slope, float power) {
+__global__ void relu2_forward_kernel(float* out, const float* inp, int sequence_length, int N, int T) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N * T) {
-        float x = inp[idx];
-        float result = 0.0;
-
-        // Flat section
-        if (x < x_intercept) {
-            result = 0.0;
-        }
-        // Linear section
-        else if (x >= x_intercept && x <= 0) {
-            result = linear_slope * x + y_intercept;
-        }
-        // Polynomial section
-        else if (x > 0) {
-            result = powf(x, power) + y_intercept;
-        }
-
-        // Divide by sequence length
-        out[idx] = result / sequence_length / 1000.0;
-        //out[idx] = result / 1000.0;
-        // out[idx] = result / 1000.0;
+        float value = inp[idx];
+        value = value > 0 ? value * value : 0; // ReLU^2
+        out[idx] = value / sequence_length;
     }
 }
 
@@ -413,31 +396,12 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
 	}
 }
 
-
-__global__ void polymax_backward_kernel(float* dpreatt, const float* datt, const float* preatt, int sequence_length, int N, int T, float x_intercept, float y_intercept, float linear_slope, float power) {
+__global__ void relu2_backward_kernel(float* dpreatt, const float* datt, const float* preatt, int sequence_length, int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N * T) {
+    if (idx < B * T * C) {
         float grad = datt[idx];
-        float x = preatt[idx];
-        float dresult_dx = 0.0;
-
-        // Flat section
-        if (x < x_intercept) {
-            dresult_dx = 0.0;
-        }
-        // Linear section
-        else if (x >= x_intercept && x <= 0) {
-            dresult_dx = linear_slope;
-        }
-        // Polynomial section
-        else if (x > 0) {
-            dresult_dx = power * powf(x, power - 1);
-        }
-
-        // Gradient with respect to input
-        dpreatt[idx] = (dresult_dx * grad) / sequence_length/ 1000.0;
-        //dpreatt[idx] = (dresult_dx * grad) / 1000.0;
-        // dpreatt[idx] = (dresult_dx * grad) / 1000.0;
+        float preatt_val = preatt[idx];
+        dpreatt[idx] = (preatt_val > 0 ? 2 * preatt_val * grad / sequence_length : 0); // ReLU^2 backward
     }
 }
 
@@ -671,16 +635,10 @@ void attention_forward(float* out, float* qkvr, float* att,
                        float* inp,
                        int B, int T, int C, int NH) {
     const int block_size = 256;
-    const int polymax_block_size = 256;
+    const int relu_block_size = 256;
 
     int HS = C / NH; // head size
     int sequence_length = T; // Sequence length
-
-    // Polymax configuration
-    float x_intercept = -100.0;
-    float y_intercept = 0.0;
-    float linear_slope = y_intercept / (-x_intercept);
-    float power = 1.0;
 
     float* q = qkvr + 0 * B * T * C;
     float* k = qkvr + 1 * B * T * C;
@@ -696,8 +654,8 @@ void attention_forward(float* out, float* qkvr, float* att,
     float* preatt = inp;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
 
-    int grid_size = CEIL_DIV(B * NH * T, polymax_block_size);
-    polymax_forward_kernel<<<grid_size, polymax_block_size>>>(att, preatt, sequence_length, B * NH, T, x_intercept, y_intercept, linear_slope, power);
+    int grid_size = CEIL_DIV(B * NH * T, relu_block_size);
+    relu2_forward_kernel<<<grid_size, relu_block_size>>>(att, preatt, sequence_length, B * NH, T);
     cudaCheck(cudaGetLastError());
 
     float* vaccum = inp;
@@ -707,8 +665,6 @@ void attention_forward(float* out, float* qkvr, float* att,
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
-
-
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
     const int block_size = 256;
@@ -762,7 +718,6 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-
 void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* scratch,
                         const float* dout,
                         const float* qkvr, const float* att,
@@ -772,12 +727,6 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     const float one = 1.0f;
     const float zero = 0.0f;
     int sequence_length = T; // Sequence length
-
-    // Polymax configuration
-    float x_intercept = -250.0;
-    float y_intercept = 1.0;
-    float linear_slope = y_intercept / (-x_intercept);
-    float power = 1.0;
 
     const float *q = qkvr + 0 * B * T * C;
     const float *k = qkvr + 1 * B * T * C;
@@ -794,7 +743,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
 
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
 
-    polymax_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, sequence_length, x_intercept, y_intercept, linear_slope, power, B * NH, T);
+    relu2_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, sequence_length, B, T, C);
     cudaCheck(cudaGetLastError());
 
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH));
@@ -1494,7 +1443,6 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
 
-    int train_steps = 10000;
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
@@ -1521,7 +1469,6 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'n') { train_steps = atoi(argv[i+1]); } // new argument for train steps
         else { error_usage(); }
     }
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1573,9 +1520,7 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1);
-    //int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
-    int train_num_batches = train_steps; // use the train_steps directly
-
+    int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
     int val_num_batches = val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
     printf("| train_num_batches     | %-50d |\n", train_num_batches);

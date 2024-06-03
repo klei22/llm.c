@@ -243,29 +243,64 @@ __device__ float vec_at(const float4& vec, int index) {
     return reinterpret_cast<const float*>(&vec)[index];
 }
 
-__global__ void polymax_forward_kernel(float* out, const float* inp, int sequence_length, int N, int T, float x_intercept, float y_intercept, float linear_slope, float power) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N * T) {
-        float x = inp[idx];
-        float result = 0.0;
+__global__ void softmax_forward_kernel5(float* out, float inv_temperature, const float* inp, int N, int T) {
+    // inp, out shape: (N, T, T), where N = B * NH
+    // fuses the multiplication by scale inside attention
+    // directly autoregressive, so we only compute the lower triangular part
+    // uses the online softmax algorithm
+    assert(T % 4  == 0);
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    // micro-optimization: we iterate backwards so that
+    // after the softmax backward operation completes, the cache retains the
+    // part of the matrix close to the upper left corner, which benefits the
+    // matmul operation that immediately follows.
+    // int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank(); // forward order
+    int idx = (gridDim.x - blockIdx.x - 1) * warp.meta_group_size() + warp.meta_group_rank(); // backward order
+    if(idx >= N * T) {
+        return;
+    }
+    int own_pos = idx % T;
+    int pos_by_4 = own_pos / 4;
 
-        // Flat section
-        if (x < x_intercept) {
-            result = 0.0;
-        }
-        // Linear section
-        else if (x >= x_intercept && x <= 0) {
-            result = linear_slope * x + y_intercept;
-        }
-        // Polynomial section
-        else if (x > 0) {
-            result = powf(x, power) + y_intercept;
-        }
+    // one row of inp, i.e. inp[idx, :] of shape (T,)
+    const float* x = inp + idx * T;
 
-        // Divide by sequence length
-        out[idx] = result / sequence_length / 1000.0;
-        //out[idx] = result / 1000.0;
-        // out[idx] = result / 1000.0;
+    // not INF, so we don't get NaNs accidentally when subtracting two values.
+    float maxval = -FLT_MAX;
+    float sumval = 0.0f;
+
+    const float4* x_vec = reinterpret_cast<const float4*>(x);
+    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
+        float4 v = x_vec[i];
+        float old_maxval = maxval;
+        for(int k = 0; k < 4; ++k) {
+            maxval = fmaxf(maxval, vec_at(v, k));
+        }
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        for(int k = 0; k < 4; ++k) {
+            sumval += expf(inv_temperature * (vec_at(v, k) - maxval));
+        }
+    }
+
+    if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
+        float old_maxval = maxval;
+        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        sumval += expf(inv_temperature * (x[4*pos_by_4 + warp.thread_rank()] - maxval));
+    }
+
+    float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
+    sumval *= expf(inv_temperature * (maxval - global_maxval));
+
+    float sum = cg::reduce(warp, sumval, cg::plus<float>{});
+    float norm = 1.f / sum;
+
+    // divide the whole row by the sum
+    for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
+        // recalculation is faster than doing the round-trip through memory.
+        float ev = expf(inv_temperature * (__ldcs(x + i) - global_maxval));
+        __stcs(out + idx * T + i, ev * norm);
     }
 }
 
@@ -413,34 +448,50 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
 	}
 }
 
+__global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
+                                                       int B, int T, int C, float scale) {
+    constexpr const int BlockSize = 256;
+    constexpr int T_per_block = 4;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    __shared__ float block_acc[32];
 
-__global__ void polymax_backward_kernel(float* dpreatt, const float* datt, const float* preatt, int sequence_length, int N, int T, float x_intercept, float y_intercept, float linear_slope, float power) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N * T) {
-        float grad = datt[idx];
-        float x = preatt[idx];
-        float dresult_dx = 0.0;
+    int idx = blockIdx.y;
+    // go through blocks in reverse order, so the slowest block starts first
+    int t0 = T - 1 - T_per_block*blockIdx.x;
 
-        // Flat section
-        if (x < x_intercept) {
-            dresult_dx = 0.0;
-        }
-        // Linear section
-        else if (x >= x_intercept && x <= 0) {
-            dresult_dx = linear_slope;
-        }
-        // Polynomial section
-        else if (x > 0) {
-            dresult_dx = power * powf(x, power - 1);
+    att += idx * T * T;
+    datt += idx * T * T;
+    dpreatt += idx * T * T;
+
+    if (warp.meta_group_rank() == 0) {
+        block_acc[warp.thread_rank()] = 0;
+    }
+
+    for(int to = 0; to < T_per_block; ++to) {
+        int t = t0 - to;
+        if(t < 0) return;
+        const float* att_bth = att + t * T;
+        const float* datt_bth = datt + t * T;
+        float* dpreatt_bth = dpreatt + t * T;
+
+        float local_sum = 0;
+        for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+            local_sum += att_bth[t2] * datt_bth[t2];
         }
 
-        // Gradient with respect to input
-        dpreatt[idx] = (dresult_dx * grad) / sequence_length/ 1000.0;
-        //dpreatt[idx] = (dresult_dx * grad) / 1000.0;
-        // dpreatt[idx] = (dresult_dx * grad) / 1000.0;
+        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block.sync();
+        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+
+        for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
+            // don't touch the cache. Some parts will still be here from the previous loop, and
+            // we want to exploit those.
+            float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
+            __stcs(dpreatt_bth + t3, scale * acc);
+        }
     }
 }
-
 
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
@@ -670,45 +721,49 @@ void matmul_forward_cublaslt(float* out,
 void attention_forward(float* out, float* qkvr, float* att,
                        float* inp,
                        int B, int T, int C, int NH) {
+    // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
+    // Its contents will be overwritten by this function.
     const int block_size = 256;
-    const int polymax_block_size = 256;
+    const int softmax_block_size = 256;
 
+    // inp is (B, T, 3C) QKV
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
     int HS = C / NH; // head size
-    int sequence_length = T; // Sequence length
 
-    // Polymax configuration
-    float x_intercept = -100.0;
-    float y_intercept = 0.0;
-    float linear_slope = y_intercept / (-x_intercept);
-    float power = 1.0;
-
-    float* q = qkvr + 0 * B * T * C;
-    float* k = qkvr + 1 * B * T * C;
-    float* v = qkvr + 2 * B * T * C;
-
+    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
+    float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 
+    // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
     const float beta = 0.0f;
     float* preatt = inp;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
 
-    int grid_size = CEIL_DIV(B * NH * T, polymax_block_size);
-    polymax_forward_kernel<<<grid_size, polymax_block_size>>>(att, preatt, sequence_length, B * NH, T, x_intercept, y_intercept, linear_slope, power);
+    // multiply all elements of preatt elementwise by scale
+    float scale = 1.0 / sqrtf(HS);
+    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
+    softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
     cudaCheck(cudaGetLastError());
 
+    // new approach: first cuBLAS another batched matmul
     float* vaccum = inp;
+    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
 
+    // now unpermute
+    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
-
-
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
     const int block_size = 256;
@@ -762,7 +817,6 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-
 void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* scratch,
                         const float* dout,
                         const float* qkvr, const float* att,
@@ -770,42 +824,38 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     const int block_size = 256;
     int HS = C / NH; // head size
     const float one = 1.0f;
-    const float zero = 0.0f;
-    int sequence_length = T; // Sequence length
-
-    // Polymax configuration
-    float x_intercept = -250.0;
-    float y_intercept = 1.0;
-    float linear_slope = y_intercept / (-x_intercept);
-    float power = 1.0;
-
-    const float *q = qkvr + 0 * B * T * C;
-    const float *k = qkvr + 1 * B * T * C;
-    const float *v = qkvr + 2 * B * T * C;
-    float *dq = dqkvr + 0 * B * T * C;
-    float *dk = dqkvr + 1 * B * T * C;
-    float *dv = dqkvr + 2 * B * T * C;
-
+    const float zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
+    // unpack convenience pointers into q, k, v
+    const float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    float *dq, *dk, *dv;
+    dq = dqkvr + 0 * B * T * C;
+    dk = dqkvr + 1 * B * T * C;
+    dv = dqkvr + 2 * B * T * C;
+    // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
-
+    // backward into datt
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &one, v, HS, T * HS, scratch, HS, T * HS, &zero, datt, T, T * T, B * NH));
-
+    // backward into dv
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
-
-    polymax_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, sequence_length, x_intercept, y_intercept, linear_slope, power, B * NH, T);
+    // backward into preatt
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
     cudaCheck(cudaGetLastError());
-
+    // backward into q
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH));
-
+    // backward into k
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, q, HS, T * HS, dpreatt, T, T * T, &zero, dk, HS, T * HS, B * NH));
-
+    // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
-
 
 // replaces logits with logit gradients
 void fused_classifier3(float* logits, float* losses,
@@ -1494,7 +1544,6 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
 
-    int train_steps = 10000;
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
@@ -1521,7 +1570,6 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'n') { train_steps = atoi(argv[i+1]); } // new argument for train steps
         else { error_usage(); }
     }
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1573,9 +1621,7 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1);
-    //int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
-    int train_num_batches = train_steps; // use the train_steps directly
-
+    int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
     int val_num_batches = val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
     printf("| train_num_batches     | %-50d |\n", train_num_batches);

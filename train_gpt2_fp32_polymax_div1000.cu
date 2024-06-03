@@ -263,9 +263,8 @@ __global__ void polymax_forward_kernel(float* out, const float* inp, int sequenc
         }
 
         // Divide by sequence length
-        out[idx] = result / sequence_length / 1000.0;
-        //out[idx] = result / 1000.0;
-        // out[idx] = result / 1000.0;
+        // out[idx] = result / sequence_length;
+        out[idx] = result / 1000.0;
     }
 }
 
@@ -435,9 +434,8 @@ __global__ void polymax_backward_kernel(float* dpreatt, const float* datt, const
         }
 
         // Gradient with respect to input
-        dpreatt[idx] = (dresult_dx * grad) / sequence_length/ 1000.0;
-        //dpreatt[idx] = (dresult_dx * grad) / 1000.0;
-        // dpreatt[idx] = (dresult_dx * grad) / 1000.0;
+        // dpreatt[idx] = (dresult_dx * grad) / sequence_length;
+        dpreatt[idx] = (dresult_dx * grad) / 1000.0;
     }
 }
 
@@ -678,9 +676,9 @@ void attention_forward(float* out, float* qkvr, float* att,
 
     // Polymax configuration
     float x_intercept = -100.0;
-    float y_intercept = 0.0;
+    float y_intercept = 1.0;
     float linear_slope = y_intercept / (-x_intercept);
-    float power = 1.0;
+    float power = 2.0;
 
     float* q = qkvr + 0 * B * T * C;
     float* k = qkvr + 1 * B * T * C;
@@ -774,10 +772,10 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     int sequence_length = T; // Sequence length
 
     // Polymax configuration
-    float x_intercept = -250.0;
+    float x_intercept = -128.0;
     float y_intercept = 1.0;
     float linear_slope = y_intercept / (-x_intercept);
-    float power = 1.0;
+    float power = 2.0;
 
     const float *q = qkvr + 0 * B * T * C;
     const float *k = qkvr + 1 * B * T * C;
