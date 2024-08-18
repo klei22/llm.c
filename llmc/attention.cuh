@@ -10,6 +10,94 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
+__global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, const floatX* inp, int N, int T) {
+    // inp, out shape: (N, T, T), where N = B * NH
+    // fuses the multiplication by scale inside attention
+    // directly autoregressive, so we only compute the lower triangular part
+    // uses the online softmax algorithm
+    assert(T % 4  == 0);
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+
+    // micro-optimization: we iterate backwards so that
+    // after the softmax backward operation completes, the cache retains the
+    // part of the matrix close to the upper left corner, which benefits the
+    // matmul operation that immediately follows.
+    // int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank(); // forward order
+    int idx = (gridDim.x - blockIdx.x - 1) * num_warps + warp_id; // backward order
+    if(idx >= N * T) {
+        return;
+    }
+    int own_pos = idx % T;
+    int pos_by_4 = own_pos / 4;
+
+    // one row of inp, i.e. inp[idx, :] of shape (T,)
+    const floatX* x = inp + idx * T;
+
+    const floatX* x_aligned = reinterpret_cast<const floatX*>(__builtin_assume_aligned(x, 16));
+    for (int i = lane_id; i < pos_by_4; i += WARP_SIZE) {
+        float regarray[4];
+        for (int k = 0; k < 4; ++k) {
+            regarray[k] = (float)x_aligned[4*i + k];
+        }
+    }
+
+    float global_maxval = 188.0f;
+
+    //float div  = 256.0f;
+    //float sum = warpReduceSum(sumval);
+    float norm = 1.f / 1024.0f;
+
+    // divide the whole row by the sum
+    for (int i = lane_id; i <= own_pos; i += WARP_SIZE) {
+        // recalculation is faster than doing the round-trip through memory.
+        float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
+        __stcs(out + idx * T + i, (floatX)(ev * norm));
+    }
+}
+
+__global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, const floatX* att,
+                                                               int B, int T, int C, float scale) {
+    constexpr const int BlockSize = 256;
+    constexpr int T_per_block = 4;
+
+    // go through blocks in reverse order, so the slowest block starts first
+    int t0 = T - 1 - T_per_block*blockIdx.x;
+    int idx = blockIdx.y;
+
+    att += idx * T * T;
+    datt += idx * T * T;
+
+    for(int to = 0; to < T_per_block; ++to) {
+        int t = t0 - to;
+        if(t < 0) return;
+        const floatX* att_bth = att + t * T;
+        const floatX* datt_bth = datt + t * T;
+        floatX* dpreatt_bth = datt + t * T;
+
+        float local_sum = 0;
+        for (int t2 = threadIdx.x; t2 <= t; t2 += BlockSize) {
+            local_sum += (float)att_bth[t2] * (float)datt_bth[t2];
+        }
+
+        local_sum = blockReduce<warpReduceSum>(local_sum);
+
+        for (int t3 = threadIdx.x; t3 < T; t3 += BlockSize) {
+            // don't touch the cache. Some parts will still be here from the previous loop, and
+            // we want to exploit those.
+            if(t3 <= t) {
+                float acc = (float) __ldcs(att_bth + t3) * ((float) __ldcs(datt_bth + t3) - local_sum);
+                __stcs(dpreatt_bth + t3, (floatX) (scale * acc));
+            } else {
+                // explicitly set non-causal elements to zero
+                __stcs(dpreatt_bth + t3, (floatX)0.f);
+            }
+        }
+    }
+}
+
+
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
                                const floatX* inp,
@@ -82,112 +170,79 @@ __global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int 
     dinp[idx] = (floatX)dout[other_idx];
 }
 
-__global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, const floatX* inp, int N, int T) {
-    // inp, out shape: (N, T, T), where N = B * NH
-    // fuses the multiplication by scale inside attention
-    // directly autoregressive, so we only compute the lower triangular part
-    // uses the online softmax algorithm
-    assert(T % 4  == 0);
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int num_warps = blockDim.x / WARP_SIZE;
-
-    // micro-optimization: we iterate backwards so that
-    // after the softmax backward operation completes, the cache retains the
-    // part of the matrix close to the upper left corner, which benefits the
-    // matmul operation that immediately follows.
-    // int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank(); // forward order
-    int idx = (gridDim.x - blockIdx.x - 1) * num_warps + warp_id; // backward order
-    if(idx >= N * T) {
+__global__ void relumax_forward_kernel(floatX* out, float inv_temperature, const floatX* inp, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * T) {
         return;
     }
-    int own_pos = idx % T;
-    int pos_by_4 = own_pos / 4;
 
-    // one row of inp, i.e. inp[idx, :] of shape (T,)
-    const floatX* x = inp + idx * T;
-
-    // not INF, so we don't get NaNs accidentally when subtracting two values.
-    const float flt_max = 340282346638528859811704183484516925440.0f; // to avoid including float.h
-    float maxval = -flt_max;
-    float sumval = 0.0f;
-
-    const floatX* x_aligned = reinterpret_cast<const floatX*>(__builtin_assume_aligned(x, 16));
-    for (int i = lane_id; i < pos_by_4; i += WARP_SIZE) {
-        float regarray[4];
-        for (int k = 0; k < 4; ++k) {
-            regarray[k] = (float)x_aligned[4*i + k];
-        }
-        float old_maxval = maxval;
-        for(int k = 0; k < 4; ++k) {
-            maxval = fmaxf(maxval, regarray[k]);
-        }
-        sumval *= expf(inv_temperature * (old_maxval - maxval));
-        for(int k = 0; k < 4; ++k) {
-            sumval += expf(inv_temperature * (regarray[k] - maxval));
-        }
-    }
-
-    if(4*pos_by_4 + lane_id <= own_pos) {
-        float old_maxval = maxval;
-        maxval = fmaxf(maxval, (float)x[4*pos_by_4 + lane_id]);
-        sumval *= expf(inv_temperature * (old_maxval - maxval));
-        sumval += expf(inv_temperature * ((float)x[4*pos_by_4 + lane_id] - maxval));
-    }
-
-    float global_maxval = warpReduceMax(maxval);
-    sumval *= expf(inv_temperature * (maxval - global_maxval));
-
-    float sum = warpReduceSum(sumval);
-    float norm = 1.f / sum;
-
-    // divide the whole row by the sum
-    for (int i = lane_id; i <= own_pos; i += WARP_SIZE) {
-        // recalculation is faster than doing the round-trip through memory.
-        float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
-        __stcs(out + idx * T + i, (floatX)(ev * norm));
+    floatX x = static_cast<floatX>(inp[idx]);
+    if (x > static_cast<floatX>(0.0f)) {
+        out[idx] = static_cast<floatX>(inp[idx]) / static_cast<floatX>(256.0f);
+    } else {
+        out[idx] = static_cast<floatX>(0.0f);
     }
 }
 
-__global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, const floatX* att,
-                                                               int B, int T, int C, float scale) {
-    constexpr const int BlockSize = 256;
-    constexpr int T_per_block = 4;
+__global__ void relumax_backward_kernel(floatX* dinp, const floatX* dout, const floatX* inp, float inv_temperature, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * T) {
+        return;
+    }
 
-    // go through blocks in reverse order, so the slowest block starts first
-    int t0 = T - 1 - T_per_block*blockIdx.x;
-    int idx = blockIdx.y;
+    floatX x = static_cast<floatX>(inp[idx]);
 
-    att += idx * T * T;
-    datt += idx * T * T;
+    floatX grad = 0.0f;
+    floatX div  = 256.0f;
+    if (x > static_cast<floatX>(0.0f)) {
+        grad = static_cast<floatX>(1.0f) / div;
+    } else {
+        grad = static_cast<floatX>(0.0f);
+    }
 
-    for(int to = 0; to < T_per_block; ++to) {
-        int t = t0 - to;
-        if(t < 0) return;
-        const floatX* att_bth = att + t * T;
-        const floatX* datt_bth = datt + t * T;
-        floatX* dpreatt_bth = datt + t * T;
+    dinp[idx] = grad * dout[idx];
+}
 
-        float local_sum = 0;
-        for (int t2 = threadIdx.x; t2 <= t; t2 += BlockSize) {
-            local_sum += (float)att_bth[t2] * (float)datt_bth[t2];
-        }
+__global__ void softplus_forward_kernel(floatX* out, float inv_temperature, const floatX* inp, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * T) {
+        return;
+    }
 
-        local_sum = blockReduce<warpReduceSum>(local_sum);
-
-        for (int t3 = threadIdx.x; t3 < T; t3 += BlockSize) {
-            // don't touch the cache. Some parts will still be here from the previous loop, and
-            // we want to exploit those.
-            if(t3 <= t) {
-                float acc = (float) __ldcs(att_bth + t3) * ((float) __ldcs(datt_bth + t3) - local_sum);
-                __stcs(dpreatt_bth + t3, (floatX) (scale * acc));
-            } else {
-                // explicitly set non-causal elements to zero
-                __stcs(dpreatt_bth + t3, (floatX)0.f);
-            }
-        }
+    floatX x = static_cast<floatX>(inp[idx]);
+    floatX threshold = 20.0f; // can be made configurable
+    if (x > threshold) {
+        // Linear approximation when x * inv_temperature > threshold
+        out[idx] = static_cast<floatX>(inp[idx]) / static_cast<floatX>(256.0f);
+    } else {
+        // Apply the Softplus function and divide by 256
+        out[idx] = static_cast<floatX>((1.0f / inv_temperature) * logf(static_cast<float>(1.0f + expf(static_cast<float>(x))))) / static_cast<floatX>(256.0f);
     }
 }
+
+__global__ void softplus_backward_kernel(floatX* dinp, const floatX* dout, const floatX* inp, float inv_temperature, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * T) {
+        return;
+    }
+
+    floatX x = static_cast<floatX>(inp[idx]);
+    floatX threshold = 20.0f; // can be made configurable
+    floatX div = static_cast<floatX>(256.0f);
+
+    floatX grad = 0.0f;
+    if (x > threshold) {
+        // Gradient for linear region
+        grad = static_cast<floatX>(1.0f) / div;
+    } else {
+        // Gradient for Softplus region
+        grad = static_cast<floatX>(1.0f) / (static_cast<floatX>(1.0f) + static_cast<floatX>(expf(-static_cast<float>(x)))) / div;
+    }
+
+    dinp[idx] = grad * dout[idx];
+}
+
+
 
 // ----------------------------------------------------------------------------
 // kernel launchers
