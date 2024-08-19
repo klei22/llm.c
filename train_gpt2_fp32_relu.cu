@@ -1292,7 +1292,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { fprintf(stderr, "Bad magic model file\n"); exit(EXIT_FAILURE); }
     if (model_header[1] != 3) {
-        // was bumped from 1 -> 3 to incorporate the padded vocab size
         fprintf(stderr, "Bad version in model file\n");
         fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
@@ -1319,9 +1318,28 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // create memory for model parameters on the device
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
 
-    // read in all the parameters from file and copy them to device
+    // Initialize weights
+    // Initialize LayerNorm weights to 1
+    for (int i = 0; i < model->config.num_layers; i++) {
+        cudaCheck(cudaMemset(model->params.ln1w + i * model->config.channels, 0, model->config.channels * sizeof(float)));
+        cudaCheck(cudaMemset(model->params.ln2w + i * model->config.channels, 0, model->config.channels * sizeof(float)));
+        // Set LayerNorm weights to 1
+        float ones = 1.0f;
+        cudaCheck(cudaMemcpy(model->params.ln1w + i * model->config.channels, &ones, model->config.channels * sizeof(float), cudaMemcpyHostToDevice));
+        cudaCheck(cudaMemcpy(model->params.ln2w + i * model->config.channels, &ones, model->config.channels * sizeof(float), cudaMemcpyHostToDevice));
+    }
+    cudaCheck(cudaMemset(model->params.lnfw, 0, model->config.channels * sizeof(float)));
+    // Set final LayerNorm weights to 1
+    float ones = 1.0f;
+    cudaCheck(cudaMemcpy(model->params.lnfw, &ones, model->config.channels * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Initialize other weights with mean 0 and stdev 0.02
     float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
-    freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
+    for (size_t i = 0; i < num_parameters; i++) {
+        params_memory_cpu[i] = 0.02f * (rand() / (float)RAND_MAX - 0.5f);
+    }
+
+    // Copy initialized weights to GPU
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(params_memory_cpu);
     fcloseCheck(model_file);
