@@ -11,6 +11,13 @@ sure that those parts work out ok and that we do a += as necessary. E.g.,
 the layernorms are connected to the residuals so we += in layernorm backward.
 */
 
+enum ActivationMode {
+    RELU,
+    SOFTPLUS,
+    SOFTMAX
+};
+
+#define RELU_DIVISOR 256.0f
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -32,6 +39,67 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
+
+// Inline function to sample a token based on the probabilities
+int sample_token_from_probabilities(float* probabilities, int vocab_size, float coin) {
+    float cumulative_prob = 0.0f;
+    for (int i = 0; i < vocab_size; ++i) {
+        cumulative_prob += probabilities[i];
+        if (coin < cumulative_prob) {
+            return i;
+        }
+    }
+    return vocab_size - 1; // In case of rounding errors
+}
+
+void inline_softmax(float* logits, int vocab_size) {
+    float max_logit = -INFINITY;
+    // Find the maximum logit to stabilize the softmax calculation
+    for (int i = 0; i < vocab_size; ++i) {
+        if (logits[i] > max_logit) {
+            max_logit = logits[i];
+        }
+    }
+
+    // Compute the exponential values and their sum
+    float sum_exp = 0.0f;
+    for (int i = 0; i < vocab_size; ++i) {
+        logits[i] = expf(logits[i] - max_logit);  // Subtract max_logit for numerical stability
+        sum_exp += logits[i];
+    }
+
+    // Normalize the logits to get probabilities
+    for (int i = 0; i < vocab_size; ++i) {
+        logits[i] /= sum_exp;
+    }
+}
+
+void top_k_filtering(float* logits, int vocab_size, int k) {
+    // Find top-k logits and set others to -INFINITY
+    for (int i = 0; i < vocab_size - k; ++i) {
+        int max_index = i;
+        for (int j = i + 1; j < vocab_size; ++j) {
+            if (logits[j] > logits[max_index]) {
+                max_index = j;
+            }
+        }
+        if (i != max_index) {
+            float temp = logits[i];
+            logits[i] = logits[max_index];
+            logits[max_index] = temp;
+        }
+    }
+    for (int i = k; i < vocab_size; ++i) {
+        logits[i] = -INFINITY;
+    }
+}
+
+void apply_repetition_penalty(float* logits, const int* generated_tokens, int current_length, float penalty) {
+    // Apply a penalty to logits for repeated tokens
+    for (int i = 0; i < current_length; ++i) {
+        logits[generated_tokens[i]] /= penalty;
+    }
+}
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -238,7 +306,68 @@ __device__ float vec_at(const float4& vec, int index) {
     return reinterpret_cast<const float*>(&vec)[index];
 }
 
-__global__ void relu_scale_forward_kernel(float* out, const float* inp, int N, int T) {
+__global__ void softmax_forward_kernel5(float* out, float inv_temperature, const float* inp, int N, int T, float softmax_divisor) {
+    // inp, out shape: (N, T, T), where N = B * NH
+    // fuses the multiplication by scale inside attention
+    // directly autoregressive, so we only compute the lower triangular part
+    // uses the online softmax algorithm
+    assert(T % 4  == 0);
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    // micro-optimization: we iterate backwards so that
+    // after the softmax backward operation completes, the cache retains the
+    // part of the matrix close to the upper left corner, which benefits the
+    // matmul operation that immediately follows.
+    // int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank(); // forward order
+    int idx = (gridDim.x - blockIdx.x - 1) * warp.meta_group_size() + warp.meta_group_rank(); // backward order
+    if(idx >= N * T) {
+        return;
+    }
+    int own_pos = idx % T;
+    int pos_by_4 = own_pos / 4;
+
+    // one row of inp, i.e. inp[idx, :] of shape (T,)
+    const float* x = inp + idx * T;
+
+    // not INF, so we don't get NaNs accidentally when subtracting two values.
+    float maxval = -FLT_MAX;
+    float sumval = 0.0f;
+
+    const float4* x_vec = reinterpret_cast<const float4*>(x);
+    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
+        float4 v = x_vec[i];
+        float old_maxval = maxval;
+        for(int k = 0; k < 4; ++k) {
+            maxval = fmaxf(maxval, vec_at(v, k));
+        }
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        for(int k = 0; k < 4; ++k) {
+            sumval += expf(inv_temperature * (vec_at(v, k) - maxval));
+        }
+    }
+
+    if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
+        float old_maxval = maxval;
+        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        sumval += expf(inv_temperature * (x[4*pos_by_4 + warp.thread_rank()] - maxval));
+    }
+
+    float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
+    sumval *= expf(inv_temperature * (maxval - global_maxval));
+
+    float sum = cg::reduce(warp, sumval, cg::plus<float>{});
+    float norm = 1.f / ( sum * softmax_divisor );
+
+    // divide the whole row by the sum
+    for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
+        // recalculation is faster than doing the round-trip through memory.
+        float ev = expf(inv_temperature * (__ldcs(x + i) - global_maxval));
+        __stcs(out + idx * T + i, ev * norm);
+    }
+}
+
+__global__ void relu_scale_forward_kernel(float* out, const float* inp, int N, int T, float softmax_divisor) {
     // inp, out shape: (N, T, T), where N = B * NH
     // Apply ReLU and then scale by 1/1024.0f
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -253,14 +382,125 @@ __global__ void relu_scale_forward_kernel(float* out, const float* inp, int N, i
     float relu_val = fmaxf(0.0f, val);
 
     // Scale by 1/1024.0f
-    out[idx] = relu_val / 1024.0f;
+    out[idx] = relu_val / softmax_divisor;
 }
 
+__global__ void relu_scale_backward_kernel(float* dinp, const float* dout, const float* inp, int N, int T, float softmax_divisor) {
+    // dout, dinp, inp shape: (N, T, T), where N = B * NH
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * T * T) {
+        return;
+    }
+
+    // Compute the gradient
+    float relu_grad = inp[idx] > 0.0f ? 1.0f : 0.0f;
+
+    // Apply the chain rule and scale by softmax_divisor
+    dinp[idx] = dout[idx] * relu_grad / softmax_divisor;
+}
 
 __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
         out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
+    }
+}
+
+#define SOFTPLUS_BETA 1.0f
+#define SOFTPLUS_THRESHOLD 20.0f
+
+__global__ void softplus_forward_kernel(float* out, const float* inp, int N, int T, float softmax_divisor) {
+    // inp, out shape: (N, T, T), where N = B * NH
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * T * T) {
+        return;
+    }
+
+    // Load the input
+    float val = inp[idx];
+    float beta_val = SOFTPLUS_BETA * val;
+
+    // Apply the Softplus function
+    float softplus_val;
+    if (beta_val > SOFTPLUS_THRESHOLD) {
+        // For large inputs, revert to linear function for numerical stability
+        softplus_val = val;
+    } else {
+        softplus_val = log1pf(expf(beta_val)) / SOFTPLUS_BETA;
+    }
+
+    // Store the result
+    out[idx] = softplus_val / softmax_divisor;
+}
+
+__global__ void softplus_backward_kernel(float* dinp, const float* dout, const float* inp, int N, int T, float softmax_divisor) {
+    // dout, dinp, inp shape: (N, T, T), where N = B * NH
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * T * T) {
+        return;
+    }
+
+    // Load the input
+    float val = inp[idx];
+    float beta_val = SOFTPLUS_BETA * val;
+
+    // Compute the gradient of Softplus
+    float softplus_grad;
+    if (beta_val > SOFTPLUS_THRESHOLD) {
+        // For large inputs, the gradient is 1
+        softplus_grad = 1.0f;
+    } else {
+        softplus_grad = 1.0f / (1.0f + expf(-beta_val));
+    }
+
+    // Apply the chain rule
+    dinp[idx] = dout[idx] * softplus_grad / softmax_divisor;
+}
+
+
+__global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
+                                                       int B, int T, int C, float scale, float softmax_divisor) {
+    constexpr const int BlockSize = 256;
+    constexpr int T_per_block = 4;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    __shared__ float block_acc[32];
+
+    int idx = blockIdx.y;
+    // go through blocks in reverse order, so the slowest block starts first
+    int t0 = T - 1 - T_per_block*blockIdx.x;
+
+    att += idx * T * T;
+    datt += idx * T * T;
+    dpreatt += idx * T * T;
+
+    if (warp.meta_group_rank() == 0) {
+        block_acc[warp.thread_rank()] = 0;
+    }
+
+    for(int to = 0; to < T_per_block; ++to) {
+        int t = t0 - to;
+        if(t < 0) return;
+        const float* att_bth = att + t * T;
+        const float* datt_bth = datt + t * T;
+        float* dpreatt_bth = dpreatt + t * T;
+
+        float local_sum = 0;
+        for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+            local_sum += att_bth[t2] * datt_bth[t2];
+        }
+        local_sum = local_sum / softmax_divisor;
+
+        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block.sync();
+        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+
+        for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
+            // don't touch the cache. Some parts will still be here from the previous loop, and
+            // we want to exploit those.
+            float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
+            __stcs(dpreatt_bth + t3, scale * acc);
+        }
     }
 }
 
@@ -401,19 +641,6 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
 	}
 }
 
-__global__ void relu_scale_backward_kernel(float* dinp, const float* dout, const float* inp, int N, int T) {
-    // dout, dinp, inp shape: (N, T, T), where N = B * NH
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N * T * T) {
-        return;
-    }
-
-    // Compute the gradient
-    float relu_grad = inp[idx] > 0.0f ? 1.0f : 0.0f;
-
-    // Apply the chain rule and scale by 1/1024.0f
-    dinp[idx] = dout[idx] * relu_grad / 1024.0f;
-}
 
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
@@ -664,18 +891,12 @@ void matmul_forward(float* out,
 
 void attention_forward(float* out, float* qkvr, float* att,
                        float* inp,
-                       int B, int T, int C, int NH) {
-    // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
-    // Its contents will be overwritten by this function.
+                       int B, int T, int C, int NH, ActivationMode mode, float softmax_divisor) {
     const int block_size = 256;
     const int softmax_block_size = 256;
-
-    // inp is (B, T, 3C) QKV
-    // preatt, att are (B, NH, T, T)
-    // output is (B, T, C)
     int HS = C / NH; // head size
 
-    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
+    // Permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
     float *q, *k, *v;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
@@ -685,33 +906,37 @@ void attention_forward(float* out, float* qkvr, float* att,
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 
-    // batched matrix multiply with cuBLAS
+    // Batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
     const float beta = 0.0f;
     float* preatt = inp;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
 
+    // Apply the selected activation function
     int grid_size = CEIL_DIV(B * NH * T * T, block_size);
-    relu_scale_forward_kernel<<<grid_size, block_size>>>(att, preatt, B * NH, T);
+    switch (mode) {
+        case RELU:
+            relu_scale_forward_kernel<<<grid_size, block_size>>>(att, preatt, B * NH, T, softmax_divisor);
+            break;
+        case SOFTPLUS:
+            softplus_forward_kernel<<<grid_size, block_size>>>(att, preatt, B * NH, T, softmax_divisor);
+            break;
+        case SOFTMAX:
+            softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, 1.0f, preatt, B * NH, T, softmax_divisor);
+            break;
+    }
     cudaCheck(cudaGetLastError());
 
-    // multiply all elements of preatt elementwise by scale
-    // float scale = 1.0 / sqrtf(HS);
-    // int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
-    // softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
-    // cudaCheck(cudaGetLastError());
-
-    // new approach: first cuBLAS another batched matmul
+    // Perform the final matrix multiply
     float* vaccum = inp;
-    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
 
-    // now unpermute
-    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+    // Unpermute
     num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
+
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
     const int block_size = 256;
@@ -768,7 +993,7 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
 void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* scratch,
                         const float* dout,
                         const float* qkvr, const float* att,
-                        int B, int T, int C, int NH) {
+                        int B, int T, int C, int NH, ActivationMode mode, float softmax_divisor) {
     const int block_size = 256;
     int HS = C / NH; // head size
     const float one = 1.0f;
@@ -792,11 +1017,21 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
     // backward into preatt
 
-    //int hs = C / NH; // head size
-    //float scale = 1.0f / sqrtf(hs);
-    //softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
     //cudaCheck(cudaGetLastError());
-    relu_scale_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T);
+
+    switch (mode) {
+        case RELU:
+            relu_scale_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, softmax_divisor);
+            break;
+        case SOFTPLUS:
+            softplus_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, softmax_divisor);
+            break;
+        case SOFTMAX:
+            softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale, softmax_divisor);
+            break;
+    }
     cudaCheck(cudaGetLastError());
 
 
@@ -1105,7 +1340,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T, ActivationMode mode, float softmax_divisor) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
@@ -1209,7 +1444,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, mode, softmax_divisor);
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
@@ -1247,7 +1482,7 @@ void gpt2_zero_grad(GPT2 *model) {
     if (model->grads_memory != NULL) { cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float))); }
 }
 
-void gpt2_backward(GPT2 *model) {
+void gpt2_backward(GPT2 *model, ActivationMode mode, float softmax_divisor) {
 
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -1363,7 +1598,7 @@ void gpt2_backward(GPT2 *model) {
         float* buffer_a = l_atty;
         float* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
 
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
+        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, mode, softmax_divisor);
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
@@ -1497,6 +1732,8 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
 
+
+    ActivationMode mode = RELU; // Default mode
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
@@ -1504,6 +1741,7 @@ int main(int argc, char *argv[]) {
     int B = 4; // batch size
     int T = 1024; // sequence length max
     float learning_rate = 3e-4f;
+    float softmax_divisor = 256.0f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
@@ -1523,6 +1761,13 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'd') { softmax_divisor = atof(argv[i+1]); }
+        else if (argv[i][1] == 'a') {
+          if (strcmp(argv[i+1], "relu") == 0) mode = RELU;
+          else if (strcmp(argv[i+1], "softplus") == 0) mode = SOFTPLUS;
+          else if (strcmp(argv[i+1], "softmax") == 0) mode = SOFTMAX;
+          else error_usage();
+        }
         else { error_usage(); }
     }
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1572,7 +1817,7 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
-    int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
+    int train_num_batches = 3*train_loader.num_tokens / (B*T); // let's do 3 epoch by default for now
     int val_num_batches = val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
@@ -1607,7 +1852,7 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T, mode, softmax_divisor);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1628,7 +1873,7 @@ int main(int argc, char *argv[]) {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                gpt2_forward(&model, gen_tokens, NULL, B, T, mode, softmax_divisor);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
@@ -1661,9 +1906,9 @@ int main(int argc, char *argv[]) {
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, mode, softmax_divisor);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model);
+        gpt2_backward(&model, mode, softmax_divisor);
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
