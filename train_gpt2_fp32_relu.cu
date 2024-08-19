@@ -1773,6 +1773,7 @@ int main(int argc, char *argv[]) {
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
+    int epochs = 3; // number of passes through full dataset
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -1789,6 +1790,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { softmax_divisor = atof(argv[i+1]); }
+        else if (argv[i][1] == 'e') { epochs = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') {
           if (strcmp(argv[i+1], "relu") == 0) mode = RELU;
           else if (strcmp(argv[i+1], "softplus") == 0) mode = SOFTPLUS;
@@ -1810,6 +1812,7 @@ int main(int argc, char *argv[]) {
     printf("| val_max_steps         | %-50d |\n", val_max_steps);
     printf("| sample_every          | %-50d |\n", sample_every);
     printf("| genT                  | %-50d |\n", genT);
+    printf("| epochs                | %-50d |\n", epochs);
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // set up the device
@@ -1844,7 +1847,7 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
-    int train_num_batches = 3*train_loader.num_tokens / (B*T); // let's do 3 epoch by default for now
+    int train_num_batches = epochs*train_loader.num_tokens / (B*T); // let's do 3 epoch by default for now
     int val_num_batches = val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
