@@ -1318,20 +1318,28 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // create memory for model parameters on the device
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
 
-    // Initialize weights
     // Initialize LayerNorm weights to 1
     for (int i = 0; i < model->config.num_layers; i++) {
         cudaCheck(cudaMemset(model->params.ln1w + i * model->config.channels, 0, model->config.channels * sizeof(float)));
         cudaCheck(cudaMemset(model->params.ln2w + i * model->config.channels, 0, model->config.channels * sizeof(float)));
-        // Set LayerNorm weights to 1
         float ones = 1.0f;
         cudaCheck(cudaMemcpy(model->params.ln1w + i * model->config.channels, &ones, model->config.channels * sizeof(float), cudaMemcpyHostToDevice));
         cudaCheck(cudaMemcpy(model->params.ln2w + i * model->config.channels, &ones, model->config.channels * sizeof(float), cudaMemcpyHostToDevice));
     }
     cudaCheck(cudaMemset(model->params.lnfw, 0, model->config.channels * sizeof(float)));
-    // Set final LayerNorm weights to 1
     float ones = 1.0f;
     cudaCheck(cudaMemcpy(model->params.lnfw, &ones, model->config.channels * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Initialize all biases to zero
+    for (int i = 0; i < model->config.num_layers; i++) {
+        cudaCheck(cudaMemset(model->params.ln1b + i * model->config.channels, 0, model->config.channels * sizeof(float)));
+        cudaCheck(cudaMemset(model->params.qkvb + i * 3 * model->config.channels, 0, 3 * model->config.channels * sizeof(float)));
+        cudaCheck(cudaMemset(model->params.attprojb + i * model->config.channels, 0, model->config.channels * sizeof(float)));
+        cudaCheck(cudaMemset(model->params.ln2b + i * model->config.channels, 0, model->config.channels * sizeof(float)));
+        cudaCheck(cudaMemset(model->params.fcb + i * 4 * model->config.channels, 0, 4 * model->config.channels * sizeof(float)));
+        cudaCheck(cudaMemset(model->params.fcprojb + i * model->config.channels, 0, model->config.channels * sizeof(float)));
+    }
+    cudaCheck(cudaMemset(model->params.lnfb, 0, model->config.channels * sizeof(float)));
 
     // Initialize other weights with mean 0 and stdev 0.02
     float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
@@ -1357,6 +1365,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
+
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T, ActivationMode mode, float softmax_divisor) {
     // targets are optional and could be NULL
