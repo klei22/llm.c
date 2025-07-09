@@ -989,7 +989,6 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     // backward into dv
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
     // backward into preatt
-    int hs = C / NH; // head size
     relu2_backward_kernel<<<CEIL_DIV(B * NH * T * T, 256), 256>>>(dpreatt, datt, att, B * NH, T);
     cudaCheck(cudaGetLastError());
     // backward into q
@@ -1534,6 +1533,8 @@ void gpt2_backward(GPT2 *model) {
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         float* l_qkvr = acts.qkvr + l * B * T * 3*C;
+        float* l_qrstd = acts.qrstd + l * B * NH * T;
+        float* l_krstd = acts.krstd + l * B * NH * T;
         float* l_atty = acts.atty + l * B * T * C;
         float* l_att = acts.att + l * B * NH * T * T;
         float* l_residual2 = acts.residual2 + l * B * T * C;
