@@ -10,6 +10,9 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
+#define QK_NORM_EPS 1e-5f
+#define QK_NORM_SCALE 1.0f
+
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
                                const floatX* inp,
@@ -80,6 +83,121 @@ __global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int 
     int d_ = rest % d;
     int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
     dinp[idx] = (floatX)dout[other_idx];
+}
+
+__global__ void qk_norm_forward_kernel(floatX* q, floatX* k, float* qrstd, float* krstd,
+                                       float scale, int N, int HS) {
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+    int idx = blockIdx.x * num_warps + warp_id;
+    if (idx >= N) return;
+    q += idx * HS;
+    k += idx * HS;
+    float sumq = 0.0f;
+    float sumk = 0.0f;
+    for(int i = lane_id; i < HS; i += WARP_SIZE) {
+        float qv = (float)__ldcs(q + i);
+        float kv = (float)__ldcs(k + i);
+        sumq += qv * qv;
+        sumk += kv * kv;
+    }
+    sumq = warpReduceSum(sumq);
+    sumk = warpReduceSum(sumk);
+    float invq = rsqrtf(sumq / HS + QK_NORM_EPS);
+    float invk = rsqrtf(sumk / HS + QK_NORM_EPS);
+    if (lane_id == 0) {
+        qrstd[idx] = invq;
+        krstd[idx] = invk;
+    }
+    float qscale = scale * invq;
+    float kscale = scale * invk;
+    for(int i = lane_id; i < HS; i += WARP_SIZE) {
+        float qv = (float)__ldcs(q + i) * qscale;
+        float kv = (float)__ldcs(k + i) * kscale;
+        __stcs(q + i, (floatX)qv);
+        __stcs(k + i, (floatX)kv);
+    }
+}
+
+__global__ void qk_norm_backward_kernel(floatX* dq, floatX* dk,
+                                         const floatX* dqn, const floatX* dkn,
+                                         const floatX* q, const floatX* k,
+                                         const float* qrstd, const float* krstd,
+                                         float scale, int N, int HS) {
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+    int idx = blockIdx.x * num_warps + warp_id;
+    if (idx >= N) return;
+    q += idx * HS;
+    k += idx * HS;
+    dqn += idx * HS;
+    dkn += idx * HS;
+    dq += idx * HS;
+    dk += idx * HS;
+    float invq = qrstd[idx];
+    float invk = krstd[idx];
+    float inv_factor_q = 1.0f / (scale * invq);
+    float inv_factor_k = 1.0f / (scale * invk);
+    float dotq = 0.0f;
+    float dotk = 0.0f;
+    for(int i = lane_id; i < HS; i += WARP_SIZE) {
+        float xq = (float)__ldcs(q + i) * inv_factor_q;
+        float gq = (float)__ldcs(dqn + i);
+        dotq += xq * gq;
+        float xk = (float)__ldcs(k + i) * inv_factor_k;
+        float gk = (float)__ldcs(dkn + i);
+        dotk += xk * gk;
+    }
+    dotq = warpReduceSum(dotq);
+    dotk = warpReduceSum(dotk);
+    float coeffq1 = scale * invq;
+    float coeffq2 = scale * invq * invq * invq / HS;
+    float coeffk1 = scale * invk;
+    float coeffk2 = scale * invk * invk * invk / HS;
+    for(int i = lane_id; i < HS; i += WARP_SIZE) {
+        float xq = (float)__ldcs(q + i) * inv_factor_q;
+        float gq = (float)__ldcs(dqn + i);
+        float xk = (float)__ldcs(k + i) * inv_factor_k;
+        float gk = (float)__ldcs(dkn + i);
+        __stcs(dq + i, (floatX)(coeffq1 * gq - coeffq2 * xq * dotq));
+        __stcs(dk + i, (floatX)(coeffk1 * gk - coeffk2 * xk * dotk));
+    }
+}
+
+__global__ void relu2_forward_kernel(floatX* out, const floatX* inp, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * T * T;
+    if(idx >= total) return;
+    int j = idx % T;
+    int i = (idx / T) % T;
+    if(j <= i) {
+        float v = (float)__ldcs(inp + idx);
+        float r = fmaxf(v, 0.0f);
+        __stcs(out + idx, (floatX)((r * r) * 0.01f));
+    } else {
+        __stcs(out + idx, (floatX)0.0f);
+    }
+}
+
+__global__ void relu2_backward_kernel(floatX* dpreatt, const floatX* datt, const floatX* att, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * T * T;
+    if(idx >= total) return;
+    int j = idx % T;
+    int i = (idx / T) % T;
+    if(j <= i) {
+        float a = (float)__ldcs(att + idx);
+        if(a > 0.0f) {
+            float grad = (float)__ldcs(datt + idx);
+            __stcs(dpreatt + idx, (floatX)(grad * (0.2f * sqrtf(a))));
+        } else {
+            __stcs(dpreatt + idx, (floatX)0.0f);
+        }
+    } else {
+        __stcs(dpreatt + idx, (floatX)0.0f);
+    }
 }
 
 __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, const floatX* inp, int N, int T) {
@@ -192,8 +310,8 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void attention_forward(floatX* out, floatX* qkvr, floatX* att,
-                       floatX* inp,
+void attention_forward(floatX* out, floatX* qkvr, float* qrstd, float* krstd,
+                       floatX* att, floatX* inp,
                        int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
@@ -217,10 +335,9 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     floatX* preatt = inp; // reuse inp as scratch buffer
     matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
 
-    // multiply all elements of preatt elementwise by scale
-    float scale = 1.f / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
-    softmax_forward_kernel5<<<grid_size, block_size, 0, stream>>>(att, scale, preatt, B * NH, T);
+    qk_norm_forward_kernel<<<grid_size, block_size, 0, stream>>>(q, k, qrstd, krstd, QK_NORM_SCALE, B * NH * T, HS);
+    relu2_forward_kernel<<<grid_size, block_size, 0, stream>>>(att, preatt, B * NH, T);
 
     // new approach: first cuBLAS another batched matmul
     floatX* vaccum = inp;
@@ -238,7 +355,8 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
-                        const floatX* qkvr, const floatX* att,
+                        const floatX* qkvr, const float* qrstd, const float* krstd,
+                        const floatX* att,
                         int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
@@ -257,18 +375,19 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(scratch, dout, B, T, NH, HS);
+    int grid_size;
     // backward into datt
     matmul_cublaslt(datt, v, scratch, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
     // backward into dv
     matmul_cublaslt(dv, scratch, att, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
-    const float scale = 1.0f / sqrtf((float)HS);
-    // backward into preatt. this is an in-place operation; datt turns into dpreatt here
-    softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256>>>(datt, att, B, T, C, scale);
+    relu2_backward_kernel<<<CEIL_DIV(B * NH * T * T, 256), 256>>>(datt, datt, att, B * NH, T);
     const floatX* dpreatt = datt;
     // backward into q
     matmul_cublaslt(dq, k, dpreatt, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
     // backward into k
     matmul_cublaslt(dk, q, dpreatt, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
+    grid_size = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
+    qk_norm_backward_kernel<<<grid_size, block_size, 0, stream>>>(dq, dk, dq, dk, q, k, qrstd, krstd, QK_NORM_SCALE, B * NH * T, HS);
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);
