@@ -14,15 +14,25 @@ Fused Classifier:
 struct SoftmaxParams {
     float Scale;
     float Offset;
+    int SkipTop1;
 };
 
-__device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* inp, int V, int P) {
+__device__ SoftmaxParams prepare_softmax_blockwide3(
+    int64_t idx,
+    const floatX* inp,
+    int V,
+    int P,
+    int target_ix,
+    float target_logit,
+    bool compute_skip
+) {
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
 
     const floatX* x = inp + idx * P;
     float thread_maxval = -INFINITY;
     float thread_sumval = 0.0f;
+    float thread_has_greater = 0.0f;
     int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x;
 
     // special-case loop to handle the unaligned elements at the end of the array
@@ -37,6 +47,9 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
             thread_maxval = fmaxf(thread_maxval, v);
             thread_sumval *= expf((old_maxval - thread_maxval));
             thread_sumval += expf(v - thread_maxval);
+            if (compute_skip && i*x128::size+k != target_ix && v > target_logit) {
+                thread_has_greater = 1.0f;
+            }
         }
         i -= blockDim.x;
     }
@@ -50,6 +63,12 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
             thread_maxval = fmaxf(thread_maxval, v);
             thread_sumval *= expf((old_maxval - thread_maxval));
             thread_sumval += expf(v - thread_maxval);
+            if (compute_skip) {
+                int element = i * x128::size + k;
+                if (element != target_ix && v > target_logit) {
+                    thread_has_greater = 1.0f;
+                }
+            }
         }
     }
 
@@ -58,8 +77,11 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
     thread_sumval *= expf(thread_maxval - block_maxval);
     float block_sumval = blockReduce<warpReduceSum>(thread_sumval);
 
+    float block_has_greater = blockReduce<warpReduceMax>(thread_has_greater, true, 0.0f);
+    int skip_top1 = (compute_skip && block_has_greater < 0.5f) ? 1 : 0;
+
     // return the softmax parameters
-    return SoftmaxParams{1.f / block_sumval, block_maxval};
+    return SoftmaxParams{1.f / block_sumval, block_maxval, skip_top1};
 }
 
 // will _update_ logits to logit gradients
@@ -69,20 +91,29 @@ template <bool WriteDLogits = true, bool WriteProbs = false>
 __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     fused_classifier_kernel5(floatX* logits, float* losses, floatX* probs,
                                 const float dloss, const int* targets,
-                                int B, int T, int V, int P, std::bool_constant<WriteDLogits>) {
+                                int B, int T, int V, int P, std::bool_constant<WriteDLogits>,
+                                bool skip_correct_top1) {
     // note: idx is small enough that it easily fits into 32 bit;
     // by making it a long here, we ensure that any offsets calculated with it (e.g., idx * P)
     // are done is 64 bit
     int64_t idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
     int ix = targets[idx];
 
+    bool ignore_index = (ix < 0 || ix >= V);
+    float target_logit = 0.0f;
+    if (!ignore_index) {
+        target_logit = (float)logits[idx * P + ix];
+    }
+
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
-    SoftmaxParams sp = prepare_softmax_blockwide3(idx, logits, V, P);
+    SoftmaxParams sp = prepare_softmax_blockwide3(idx, logits, V, P, ix, target_logit, skip_correct_top1 && !ignore_index);
 
     // calculate the probability needed for the loss and update (single-threaded)
     if(threadIdx.x == 0) {
-        float prob = expf((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[idx] -= logf(prob);
+        if (!ignore_index && !(skip_correct_top1 && sp.SkipTop1)) {
+            float prob = expf(target_logit - sp.Offset) * sp.Scale;
+            losses[idx] -= logf(prob);
+        }
     }
 
     // without this synchronization point we have a race condition:
@@ -94,6 +125,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const floatX* logits_vec = logits + idx * P;
+    float loss_scale = (ignore_index || (skip_correct_top1 && sp.SkipTop1)) ? 0.0f : 1.0f;
     for (int i = threadIdx.x; i < V/x128::size; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // it will be overwritten by the logits gradients which is when we reduce cache persistence
@@ -103,8 +135,8 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
             int element = i*x128::size + k;
             float prob = expf((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
             packed_probs[k] = (floatX)prob;
-            float indicator = (element == ix) ? 1.0f : 0.0f;
-            packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
+            float indicator = (!ignore_index && element == ix) ? 1.0f : 0.0f;
+            packed_logits_vec[k] = (floatX)(((prob - indicator) * dloss) * loss_scale);
         }
         if (WriteDLogits){
             // reduce cache persistence for the overwritten logits
@@ -121,8 +153,8 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     int unaligned_start = V & ~(x128::size - 1); // round down to multiple of x128::size
     for (int i = threadIdx.x + unaligned_start; i < V; i++) {
         float prob = expf((float)logits_vec[i] - sp.Offset) * sp.Scale;
-        float indicator = (i == ix) ? 1.0f : 0.0f;
-        float dlogit = (prob - indicator) * dloss;
+        float indicator = (!ignore_index && i == ix) ? 1.0f : 0.0f;
+        float dlogit = ((prob - indicator) * dloss) * loss_scale;
         if (WriteDLogits){
             __stcs(logits + idx * P + i, (floatX)dlogit);
         }
@@ -139,11 +171,13 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 template <typename Type, bool WriteDLogits>
 void fused_classifier(Type* logits, float* losses,
                       const float dloss, const int* targets,
-                      int B, int T, int V, int P, std::bool_constant<WriteDLogits> write_dlogits, cudaStream_t stream) {
+                      int B, int T, int V, int P, std::bool_constant<WriteDLogits> write_dlogits,
+                      bool skip_correct_top1, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P, write_dlogits);
+    fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(
+        logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P, write_dlogits, skip_correct_top1);
     cudaCheck(cudaGetLastError());
 }

@@ -7,6 +7,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <stdarg.h>
 #include <string>
 #include <string_view>
+#include <cstring>
 #include <sys/stat.h>
 #include <sys/types.h>
 // ----------- CPU utilities -----------
@@ -319,6 +320,7 @@ typedef struct {
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+    bool use_skip_correct_top1_loss;
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -338,6 +340,7 @@ void gpt2_init_common(GPT2 *model) {
     model->grads_memory = NULL;
     model->workload_indices = NULL; // on cpu, for encoder_backward
     model->bucket_info = NULL; // on cpu, for encoder_backward
+    model->use_skip_correct_top1_loss = false;
     // memory lazily initialized in update()
     model->m_memory = NULL;
     model->v_memory = NULL;
@@ -775,7 +778,18 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     cudaCheck(cudaMemset(acts.losses, 0, B*T*sizeof(float)));
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V); // while the memcpy is underway, validate the targets
-    fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, False, main_stream);
+    fused_classifier(
+        acts.output,
+        acts.losses,
+        dloss,
+        model->targets,
+        B,
+        T,
+        V,
+        Vp,
+        False,
+        model->use_skip_correct_top1_loss,
+        main_stream);
     cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B*T; i++) {
         mean_loss += model->cpu_losses[i];
@@ -819,7 +833,18 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V);
-    fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
+    fused_classifier(
+        acts.output,
+        acts.losses,
+        dloss,
+        model->targets,
+        B,
+        T,
+        V,
+        Vp,
+        True,
+        model->use_skip_correct_top1_loss,
+        main_stream);
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
 
@@ -1387,6 +1412,7 @@ void error_usage() {
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
+    fprintf(stderr, "  -L <string> loss function: cross_entropy or skip_top1 (default = cross_entropy)\n");
     fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
     fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
     // evaluation
@@ -1422,6 +1448,7 @@ int main(int argc, char *argv[]) {
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* lr_scheduler_type = "cosine";
+    const char* loss_variant = "cross_entropy";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write checkpoints every how many steps?
     int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
@@ -1449,6 +1476,7 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    bool use_skip_top1_loss = false;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1475,6 +1503,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
         else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
         else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
+        else if (argv[i][1] == 'L') { loss_variant = argv[i+1]; }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
@@ -1499,6 +1528,15 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
         else { error_usage(); }
+    }
+
+    if (strcmp(loss_variant, "cross_entropy") == 0) {
+        use_skip_top1_loss = false;
+    } else if (strcmp(loss_variant, "skip_top1") == 0 || strcmp(loss_variant, "skip_correct_top1") == 0) {
+        use_skip_top1_loss = true;
+    } else {
+        fprintf(stderr, "Unknown loss variant '%s'. Supported options are cross_entropy and skip_top1.\n", loss_variant);
+        exit(EXIT_FAILURE);
     }
 
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
@@ -1537,6 +1575,7 @@ int main(int argc, char *argv[]) {
     printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
     printf0("| weight decay          | %-50e |\n", weight_decay);
     printf0("| skip update lossz     | %-50f |\n", skip_update_lossz);
+    printf0("| loss function         | %-50s |\n", use_skip_top1_loss ? "skip_top1" : "cross_entropy");
     printf0("| skip update gradz     | %-50f |\n", skip_update_gradz);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
@@ -1588,6 +1627,7 @@ int main(int argc, char *argv[]) {
     model.use_master_weights = use_master_weights;
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
+    model.use_skip_correct_top1_loss = use_skip_top1_loss;
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
