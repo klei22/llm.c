@@ -91,10 +91,11 @@ typedef struct {
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
+    int use_embed_rmsnorm; // optional RMSNorm after embeddings, 0|1
 } GPT2Config;
 
 // the parameters of the model
-constexpr const int NUM_PARAMETER_TENSORS = 16;
+constexpr const int NUM_PARAMETER_TENSORS = 17;
 typedef struct {
     floatX* wte; // (V, C)
     floatX* wpe; // (maxT, C)
@@ -112,6 +113,7 @@ typedef struct {
     floatX* fcprojb; // (L, C)
     floatX* lnfw; // (C)
     floatX* lnfb; // (C)
+    floatX* embed_rms_weight; // (C) optional RMSNorm after embeddings
 } ParameterTensors;
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
@@ -136,6 +138,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[13] = L * C; // fcprojb
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
+    param_sizes[16] = config.use_embed_rmsnorm ? C : 0; // embed_rms_weight
 
     // populate the parameter sizes in bytes (all the same for now, keeping for future use)
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -157,19 +160,25 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     floatX** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb, &params->embed_rms_weight
     };
     char* params_memory_iterator = (char*)params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        *(ptrs[i]) = (floatX*)params_memory_iterator;
+        if (param_elements[i] == 0) {
+            *(ptrs[i]) = nullptr;
+        } else {
+            *(ptrs[i]) = (floatX*)params_memory_iterator;
+        }
         params_memory_iterator += param_elements[i] * param_sizeof[i];
     }
     return params_memory;
 }
 
-constexpr int NUM_ACTIVATION_TENSORS = 21;
+constexpr int NUM_ACTIVATION_TENSORS = 23;
 typedef struct {
     floatX* encoded; // (B, T, C)
+    floatX* embed_pre_rms; // (B, T, C) only when embed RMSNorm enabled
+    float* embed_rms_rstd; // (B, T) only when embed RMSNorm enabled
     floatX* ln1; // (L, B, T, C)
     float* ln1_mean; // (L, B, T)
     float* ln1_rstd; // (L, B, T)
@@ -222,35 +231,37 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     size_t NH = config.num_heads;
     size_t C = config.channels;
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
+    tensors[1] = TENSOR_SPEC(data->embed_pre_rms, config.use_embed_rmsnorm ? B * T * C : 0);
+    tensors[2] = TENSOR_SPEC(data->embed_rms_rstd, config.use_embed_rmsnorm ? B * T : 0);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
-    tensors[1] = TENSOR_SPEC(data->ln1,  (recompute < 2) ? L * B * T * C : 0);
-    tensors[2] = TENSOR_SPEC(data->ln1_mean, L * B * T);
-    tensors[3] = TENSOR_SPEC(data->ln1_rstd, L * B * T);
-    tensors[4] = TENSOR_SPEC(data->atty, L * B * T * C);
+    tensors[3] = TENSOR_SPEC(data->ln1,  (recompute < 2) ? L * B * T * C : 0);
+    tensors[4] = TENSOR_SPEC(data->ln1_mean, L * B * T);
+    tensors[5] = TENSOR_SPEC(data->ln1_rstd, L * B * T);
+    tensors[6] = TENSOR_SPEC(data->atty, L * B * T * C);
     #ifdef ENABLE_CUDNN
     // FP32 stats tensor for cuDNN to be passed to backward pass
-    tensors[5] = TENSOR_SPEC(data->att, L * B * NH * T);
+    tensors[7] = TENSOR_SPEC(data->att, L * B * NH * T);
     #else
-    tensors[5] = TENSOR_SPEC(data->att, L * B * NH * T * T);
+    tensors[7] = TENSOR_SPEC(data->att, L * B * NH * T * T);
     #endif
-    tensors[6] = TENSOR_SPEC(data->residual2, L * B * T * C);
+    tensors[8] = TENSOR_SPEC(data->residual2, L * B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
-    tensors[7] = TENSOR_SPEC(data->ln2, (recompute < 2) ? L * B * T * C : 0);
-    tensors[8] = TENSOR_SPEC(data->ln2_mean, L * B * T);
-    tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
-    tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
+    tensors[9] = TENSOR_SPEC(data->ln2, (recompute < 2) ? L * B * T * C : 0);
+    tensors[10] = TENSOR_SPEC(data->ln2_mean, L * B * T);
+    tensors[11] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
+    tensors[12] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
-    tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
-    tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
-    tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
-    tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
-    tensors[16] = TENSOR_SPEC(data->losses, B * T);
-    tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
-    tensors[18] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
+    tensors[13] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
+    tensors[14] = TENSOR_SPEC(data->residual3, L * B * T * C);
+    tensors[15] = TENSOR_SPEC(data->lnf, B * T * C);
+    tensors[16] = TENSOR_SPEC(data->lnf_mean, B * T);
+    tensors[17] = TENSOR_SPEC(data->lnf_rstd, B * T);
+    tensors[18] = TENSOR_SPEC(data->losses, B * T);
+    tensors[19] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
+    tensors[20] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
 
-    tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
-    tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
+    tensors[21] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
+    tensors[22] = TENSOR_SPEC(data->scratch_btc, B * T * C);
 }
 
 void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
@@ -348,6 +359,7 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    model->config.use_embed_rmsnorm = 0;
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -443,6 +455,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[5] = model->config.num_heads;
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
+    model_header[8] = model->config.use_embed_rmsnorm;
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
     device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
@@ -501,6 +514,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     model->config.num_heads = model_header[5];
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
+    model->config.use_embed_rmsnorm = model_header[8];
 
     // allocate memory for the model parameters
     gpt2_allocate_weights(model);
@@ -606,6 +620,11 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
                     params_memory_cpu[offset + j] = 1.0f;
                 }
             }
+            if (l == 0 && i == 16 && model->config.use_embed_rmsnorm) {
+                for (size_t j = 0; j < model->param_elements[i]; j++) {
+                    params_memory_cpu[offset + j] = 1.0f;
+                }
+            }
             // weights tensors are handled here
             if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
               || i == 4 || i == 6 || i == 10 || i == 12) {
@@ -677,7 +696,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    floatX* encoder_out = model->config.use_embed_rmsnorm ? acts.embed_pre_rms : acts.encoded;
+    encoder_forward(encoder_out, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    if (model->config.use_embed_rmsnorm) {
+        rmsnorm_forward(acts.encoded, acts.embed_rms_rstd, encoder_out, params.embed_rms_weight, B, T, C, main_stream);
+    }
 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
@@ -946,6 +969,15 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
     }
+    if (model->config.use_embed_rmsnorm) {
+        float* dweight_accum = scratchF;
+        cudaCheck(cudaMemsetAsync(dweight_accum, 0, C * sizeof(float), main_stream));
+        unsigned int seed = random_u32(&model->rng_state);
+        rmsnorm_backward(dresidual, grads.embed_rms_weight, dweight_accum,
+                         dresidual, acts.embed_pre_rms, params.embed_rms_weight,
+                         acts.embed_rms_rstd, B, T, C, seed, main_stream);
+    }
+
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
 
@@ -959,9 +991,15 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         #endif
         cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
         // reduce the gradients for non-transformer block parameters
-        floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
-        const size_t nelem[] = {Vp * C, T * C, C, C};
-        multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        if (model->config.use_embed_rmsnorm) {
+            floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb, grads.embed_rms_weight};
+            const size_t nelem[] = {Vp * C, T * C, C, C, C};
+            multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        } else {
+            floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
+            const size_t nelem[] = {Vp * C, T * C, C, C};
+            multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        }
     }
 
     cudaCheck(cudaDeviceSynchronize());
@@ -1072,6 +1110,10 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
         ptrdiff_t local_offset_full = tensor.offset + shard.offset;
         ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
+
+        if (shard.size == 0) {
+            continue;
+        }
 
         // we only want to weight decay the 2D tensors and leave all 1D tensors alone
         // in particular this also decays the embedding weights, but this is ok:
@@ -1401,6 +1443,7 @@ void error_usage() {
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
+    fprintf(stderr, "  -nr <int>   enable RMSNorm after embeddings? (default: 0)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
@@ -1449,6 +1492,7 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    int embed_rmsnorm = 0;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1487,6 +1531,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'r') { embed_rmsnorm = atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
@@ -1571,6 +1616,7 @@ int main(int argc, char *argv[]) {
     // build the GPT-2 model
     GPT2 model;
     gpt2_init_common(&model);
+    model.config.use_embed_rmsnorm = embed_rmsnorm;
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         // if we are using master weights, we'll init them later inside load_state()
@@ -1585,6 +1631,10 @@ int main(int argc, char *argv[]) {
         gpt_build_from_descriptor(&model, load_filename);
     }
 
+    if (embed_rmsnorm != model.config.use_embed_rmsnorm) {
+        printf0("embed rmsnorm flag mismatch: using model configuration value %d\n", model.config.use_embed_rmsnorm);
+    }
+
     model.use_master_weights = use_master_weights;
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
@@ -1595,6 +1645,7 @@ int main(int argc, char *argv[]) {
     printf0("| num_layers L          | %-50d |\n", model.config.num_layers);
     printf0("| num_heads NH          | %-50d |\n", model.config.num_heads);
     printf0("| channels C            | %-50d |\n", model.config.channels);
+    printf0("| embed rmsnorm        | %-50s |\n", model.config.use_embed_rmsnorm ? "enabled" : "disabled");
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf0("+-----------------------+----------------------------------------------------+\n");
 

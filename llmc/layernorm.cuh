@@ -139,6 +139,91 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
     }
 }
 
+__global__ void rmsnorm_forward_kernel(floatX* __restrict__ out, float* __restrict__ rstd,
+                                       const floatX* __restrict__ inp, const floatX* __restrict__ weight,
+                                       int N, int C) {
+    int idx = blockIdx.x;
+    if (idx >= N) { return; }
+
+    const floatX* inp_row = inp + idx * C;
+    float thread_sum = 0.0f;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float val = (float)inp_row[c];
+        thread_sum += val * val;
+    }
+
+    thread_sum = blockReduce<warpReduceSum>(thread_sum, true);
+    __shared__ float shared_inv_rms;
+    if (threadIdx.x == 0) {
+        float mean_sq = thread_sum / C;
+        float inv_rms = rsqrtf(mean_sq + 1e-5f);
+        shared_inv_rms = inv_rms;
+        if (rstd != nullptr) {
+            rstd[idx] = inv_rms;
+        }
+    }
+    __syncthreads();
+
+    float inv_rms = shared_inv_rms;
+    floatX* out_row = out + idx * C;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float val = (float)inp_row[c];
+        float scaled = val * inv_rms * (float)weight[c];
+        out_row[c] = (floatX)scaled;
+    }
+}
+
+__global__ void rmsnorm_backward_kernel(floatX* __restrict__ dinp, float* __restrict__ dweight_accum,
+                                        const floatX* __restrict__ dout, const floatX* __restrict__ inp,
+                                        const floatX* __restrict__ weight, const float* __restrict__ rstd,
+                                        int N, int C) {
+    int idx = blockIdx.x;
+    if (idx >= N) { return; }
+
+    const floatX* inp_row = inp + idx * C;
+    const floatX* dout_row = dout + idx * C;
+    floatX* dinp_row = dinp + idx * C;
+
+    float inv_rms = rstd[idx];
+    float inv_rms3 = inv_rms * inv_rms * inv_rms;
+
+    float thread_sum = 0.0f;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float xi = (float)inp_row[c];
+        float dyi = (float)dout_row[c];
+        float wi = (float)weight[c];
+        thread_sum += dyi * wi * xi;
+    }
+
+    thread_sum = blockReduce<warpReduceSum>(thread_sum, true);
+    __shared__ float shared_sum;
+    if (threadIdx.x == 0) {
+        shared_sum = thread_sum;
+    }
+    __syncthreads();
+
+    float total = shared_sum;
+    float coeff = inv_rms3 / C;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float xi = (float)inp_row[c];
+        float dyi = (float)dout_row[c];
+        float wi = (float)weight[c];
+        float contrib = dyi * xi * inv_rms;
+        atomicAdd(dweight_accum + c, contrib);
+        float ai = dyi * wi;
+        float dx = inv_rms * ai - coeff * xi * total;
+        dinp_row[c] = (floatX)dx;
+    }
+}
+
+__global__ void rmsnorm_finalize_dweight_kernel(floatX* __restrict__ dweight, const float* __restrict__ accum,
+                                                unsigned int seed, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= C) { return; }
+    float updated = accum[idx] + (float)dweight[idx];
+    stochastic_rounding(updated, dweight + idx, seed + idx);
+}
+
 __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, float* mean, float* rstd,
                                                const floatX* inp1, const floatX* inp2,
                                                const floatX* weight, const floatX* bias,
@@ -502,4 +587,34 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
     layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
+}
+
+void rmsnorm_forward(floatX* out, float* rstd,
+                     const floatX* inp, const floatX* weight,
+                     int B, int T, int C, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    int N = B * T;
+    if (N == 0) { return; }
+    const int block_size = 256;
+    int grid_size = N;
+    rmsnorm_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, rstd, inp, weight, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void rmsnorm_backward(floatX* dinp, floatX* dweight, float* dweight_accum,
+                      const floatX* dout, const floatX* inp, const floatX* weight,
+                      const float* rstd, int B, int T, int C,
+                      unsigned int seed, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    int N = B * T;
+    if (N == 0 || C == 0) { return; }
+    const int block_size = 256;
+    int grid_size = N;
+    rmsnorm_backward_kernel<<<grid_size, block_size, 0, stream>>>(dinp, dweight_accum, dout, inp, weight, rstd, N, C);
+    cudaCheck(cudaGetLastError());
+    int finalize_grid = CEIL_DIV(C, block_size);
+    if (finalize_grid > 0) {
+        rmsnorm_finalize_dweight_kernel<<<finalize_grid, block_size, 0, stream>>>(dweight, dweight_accum, seed, C);
+        cudaCheck(cudaGetLastError());
+    }
 }
